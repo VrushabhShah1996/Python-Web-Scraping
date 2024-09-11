@@ -1,0 +1,172 @@
+import csv
+import logging
+import pandas as pd
+from csv import writer
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+
+# Configure logging
+logging.basicConfig(filename='vmware_scraper.log', level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+def junk(string):
+    junk_tags = ["\n", "\t", "\r", "<p>", "</p>", "</br>", "<br>", "<td>", "</td>", "<tr>", "</tr>"]
+    for j in junk_tags:
+        string = string.replace(f"{j}", "")
+    string = string.replace("&nbsp;", " ").replace("&amp;", "&").strip()
+    return string
+
+
+def write_csv(data, filename='vmware.csv'):
+    try:
+        with open(filename, 'a', newline='', encoding='utf-8') as f_object:
+            writer_object = writer(f_object)
+            writer_object.writerow(data)
+    except IOError as e:
+        logger.error(f"Error writing to CSV file {filename}: {e}")
+
+
+def setup_driver():
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("window-size=1920x1080")
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+    return driver
+
+
+def close_driver(driver):
+    driver.quit()
+
+
+def get_links(driver):
+    driver.get('https://www.vmware.com/security/advisories.html')
+    WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.XPATH, '//select[@aria-controls="table_id"]'))).click()
+    WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, '//option[@value="100"]'))).click()
+
+    while True:
+        try:
+            links = driver.find_elements(By.XPATH, '//td[@class=" details-control"]//a')
+            for l in links:
+                write_csv([f"{l.get_attribute('href')}"])
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
+            next_page = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, '//a[@class="paginate_button next"]')))
+            next_page.click()
+        except Exception as e:
+            logger.warning(f"Exception during pagination: {e}")
+            break
+
+
+def get_data():
+    driver = setup_driver()
+    result = []
+
+    try:
+        with open('vmware.csv') as file:
+            all_links = csv.reader(file)
+            for count, links in enumerate(all_links, start=1):
+                logger.info(f"Processing link {count}: {''.join(links)}")
+                url = "".join(links)
+                driver.get(url)
+
+                item = {}
+                try:
+                    item["adv_id"] = junk(
+                        driver.find_element(By.XPATH, '//label[contains(text(),"Advisory ID")]/parent::div/span').text)
+                except Exception:
+                    item["adv_id"] = ""
+
+                try:
+                    item["cvss rating"] = junk(
+                        driver.find_element(By.XPATH, '//label[contains(text(),"CVSSv3 Range")]/parent::div/span').text)
+                except Exception:
+                    item["cvss rating"] = ""
+
+                try:
+                    item["updated on"] = junk(
+                        driver.find_element(By.XPATH, '//label[contains(text(),"Updated On")]/parent::div/span').text)
+                except Exception:
+                    item["updated on"] = ""
+
+                try:
+                    item["description"] = junk(driver.find_element(By.XPATH,
+                                                                   '//b[contains(text(),"Description")]/ancestor::section[@class="section-custom"]/parent::div/following-sibling::div[1]').text)
+                except Exception:
+                    item["description"] = ""
+
+                try:
+                    item["workaround content"] = junk(driver.find_element(By.XPATH,
+                                                                          '//b[contains(text(),"Workarounds")]/ancestor::section[@class="section-custom"]/parent::div/following-sibling::div[1]').text)
+                except Exception:
+                    item["workaround content"] = ""
+
+                try:
+                    item["Resolution"] = junk(driver.find_element(By.XPATH,
+                                                                  '//b[contains(text(),"Resolution")]/ancestor::section[@class="section-custom"]/parent::div/following-sibling::div[1]').text)
+                except Exception:
+                    item["Resolution"] = ""
+
+                try:
+                    item["References"] = junk(driver.find_element(By.XPATH,
+                                                                  '//b[contains(text(),"References")]/ancestor::section[@class="section-custom"]/parent::div/following-sibling::div[1]').text)
+                except Exception:
+                    item["References"] = ""
+
+                try:
+                    item["title"] = driver.find_element(By.XPATH,
+                                                        '//b[contains(text(),"Description")]/ancestor::section[@class="section-custom"]/parent::div/preceding-sibling::div[1]//b').text
+                except Exception:
+                    item["title"] = ""
+
+                try:
+                    matrix_table = driver.find_elements(By.XPATH,
+                                                        '(//b[contains(text(),"Response Matrix")]/ancestor::section[@class="section-custom"]/parent::div/following-sibling::div)[1]//table//tr[@class="tr"]')
+                    response_matrix = []
+                    for mt in matrix_table:
+                        data = {}
+                        try:
+                            data["product"] = junk(mt.find_element(By.XPATH, './td[@data-th="Product"]/div').text)
+                            data["Version"] = junk(mt.find_element(By.XPATH, './td[@data-th="Version"]/div').text)
+                            data["Running On"] = junk(mt.find_element(By.XPATH, './td[@data-th="Running On"]/div').text)
+                            data["CVE Identifier"] = junk(
+                                mt.find_element(By.XPATH, './td[@data-th="CVE Identifier"]/div').text)
+                            data["CVSSV3"] = junk(mt.find_element(By.XPATH, './td[@data-th="CVSSV3"]/div').text)
+                            data["Severity"] = junk(mt.find_element(By.XPATH, './td[@data-th="Severity"]/div').text)
+                            data["Fixed Version"] = junk(
+                                mt.find_element(By.XPATH, './td[@data-th="Fixed Version"]/div').text)
+                            data["Workarounds"] = junk(
+                                mt.find_element(By.XPATH, './td[@data-th="Workarounds"]/div').text)
+                            data["Additional Documents"] = junk(
+                                mt.find_element(By.XPATH, './td[@data-th="Additional Documents"]/div').text)
+                            response_matrix.append(data)
+                        except Exception as e:
+                            logger.error(f"Error extracting response matrix data: {e}")
+                    item["Response Matrix"] = response_matrix
+                except Exception:
+                    item["Response Matrix"] = []
+
+                result.append(item)
+
+        df = pd.DataFrame(result)
+        df.to_csv('vmware_detail.csv', mode="a", index=False, header=False)
+        logger.info("Data successfully written to vmware_detail.csv")
+
+    except FileNotFoundError:
+        logger.error("CSV file 'vmware.csv' not found. Ensure the file exists and is properly formatted.")
+
+    finally:
+        close_driver(driver)
+
+
+if __name__ == '__main__':
+    get_links(setup_driver())
+    get_data()

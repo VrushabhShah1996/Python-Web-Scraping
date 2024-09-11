@@ -1,0 +1,292 @@
+import datetime
+import os
+import re
+import time
+import logging
+
+import pandas as pd
+import requests
+from lxml import html
+from scrapy import Selector
+from selenium import webdriver
+from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+# Configure logging
+logging.basicConfig(filename='ikea_scraper.log', level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class Ikea:
+    def __init__(self):
+        self.session = requests.session()
+        self.today_date = datetime.datetime.now().strftime('%d%m%Y')
+        self.clean_data = re.compile(r'<.*?>')
+        self.get_driver()
+
+    def get_driver(self):
+        options = Options()
+        options.add_argument('--disable-gpu')
+        options.add_argument("start-maximized")
+        options.headless = False
+        self.driver = webdriver.Firefox(options=options)
+
+    def normalize_whitespace(self, string):
+        return re.sub(r'(\s)\1{1,}', r'\1', string)
+
+    def replace_normalize(self, name):
+        return self.normalize_whitespace(str(name).replace('\r', ' ')
+                                         .replace('\n', ' ').replace('\t', ' ').replace('"', '\\"').replace("'",
+                                                                                                            "\\'").strip())
+
+    def get_variants_data(self, variants_links):
+        variants_names, variants_article_number, swatch_images_list = [], [], []
+
+        for link in variants_links:
+            self.driver.get(link)
+            time.sleep(2)
+            res = Selector(text=self.driver.page_source)
+
+            product_name = self.replace_normalize(' '.join(res.xpath('//h1[@class="pip-header-section"]//text()').getall()))
+            variants_names.append(product_name or '')
+
+            internal_reference_number = self.replace_normalize(''.join(res.xpath(
+                '//div[@class="pip-product-summary"]//span[@data-ga-action="article_number_click"]//span[@class="pip-product-identifier__value"]//text()').get()).replace('.', ''))
+            variants_article_number.append(internal_reference_number or '')
+
+            images = res.xpath('//div[@class="pip-media-grid__media-container"]//img/@src').getall()
+            swatch_images_list.append(self.replace_normalize(images[0]) if images else '')
+
+        return variants_names, variants_article_number, swatch_images_list
+
+    def get_product_details(self, response, product_url, count, page_source):
+        item = {}
+        try:
+            item['Product URl'] = product_url
+            item['Category'] = self.replace_normalize(''.join(re.findall('"category_local":"(.*?)",', page_source)))
+            item['Product Name'] = self.replace_normalize(' '.join(response.xpath('//h1[@class="pip-header-section"]//text()').getall()))
+            item['Short Description'] = self.replace_normalize(''.join(response.xpath('//*[@class="pip-product-summary__description"]//text()').get()))
+            item['Long Description'] = self.replace_normalize('\n'.join(response.xpath('//*[@class="pip-product-details__title"]/following-sibling::div//p//text()').getall()))
+            item['Material'] = self.replace_normalize(''.join(response.xpath('//*[@id="HIDDEN_product-details-material-and-care"]//*[@class="pip-product-details__container"]//text()').getall()))
+            item['Care'] = self.extract_care_info(item['Material'])
+            item['Dimension'] = self.extract_dimensions(response)
+            item['Internal Reference Number'] = self.replace_normalize(''.join(re.findall('"mpn":"(.*?)"', self.driver.page_source)).replace('.', ''))
+            item['Price'] = self.extract_price(response)
+            item['Currency'] = self.replace_normalize(response.xpath('//*[@class="pip-pip-price-package__wrapper"]//span[contains(@class,"price__currency")]//text()').get())
+            item['Assembly Instructions'] = self.extract_assembly_instructions(response)
+            item['Packaging Details'] = self.extract_packaging_details(response)
+            item['Brand Name'] = self.replace_normalize(response.xpath('//*[@class="pip-header-section__title--big notranslate"]//text()').get())
+            item['Product Images'] = self.replace_normalize(' ,'.join(response.xpath('//*[@class="pip-media-grid__grid "]//div[@class="pip-media-grid__media-container"]//span/img/@src').getall()))
+            item['Store Notes'] = self.replace_normalize(response.xpath('//*[@class="pip-sold-separately__text"]//text()').getall())
+            item['Return Policy'] = self.get_return_policy()
+            item['Additional Information'] = self.replace_normalize(''.join(response.xpath('//*[@class="pip-sold-separately__text"]//text()').getall()))
+        except Exception as e:
+            logger.error(f"Error getting product details: {e}")
+
+        self.save_to_csv(item)
+        logger.info(f"Processed product URL: {product_url}, count: {count}")
+
+    def extract_care_info(self, material):
+        care = ''
+        if 'Wipe dry with a clean cloth' in material:
+            care = re.findall('(Wipe dry.*)', material)[0].strip()
+            try:
+                care = re.findall('(Wipe clean.*)', material)[0].strip()
+            except:
+                pass
+            material = re.findall('(.*?)Wipe dry', material)[0].strip()
+            try:
+                material = re.findall('(.*?)Wipe clean', material)[0].strip()
+            except:
+                pass
+        return care
+
+    def extract_dimensions(self, response):
+        dimension = ''
+        dimen = response.xpath('//*[@class="pip-product-dimensions__dimensions-container"]//p')
+        for d in dimen:
+            key = self.replace_normalize(d.xpath('./span//text()').get())
+            value = self.replace_normalize(d.xpath('./span/following::text()[1]').get())
+            dimension += f'{key}: {value}\n'.replace('::', ':')
+        return dimension
+
+    def extract_price(self, response):
+        price_integer = self.replace_normalize(response.xpath('//*[@class="pip-pip-price-package__wrapper"]//span[@class="pip-price__integer"]//text()').get())
+        price_decimal = self.replace_normalize(response.xpath('//*[@class="pip-pip-price-package__wrapper"]//span[@class="pip-price__decimals"]/span/text()').get())
+        if price_decimal != 'None':
+            if price_decimal == '.':
+                price_decimal = self.replace_normalize(response.xpath('//*[@class="pip-pip-price-package__wrapper"]//span[@class="pip-price__decimals"]/span/following::text()[1]').get())
+            price = f'{price_integer}.{price_decimal}'
+        else:
+            price = price_integer
+        return price
+
+    def extract_assembly_instructions(self, response):
+        assembly_instruction = []
+        asmbly_in = response.xpath('//*[@id="SEC_HIDDEN_product-details-assembly-and-documents"]//div[@class="pip-product-details__container"]//a')
+        for i in asmbly_in:
+            asmbly = {}
+            key = self.replace_normalize(i.xpath('.//text()').get())
+            value = self.replace_normalize(i.xpath('./@href').get())
+            asmbly[f'{key}'] = value
+            assembly_instruction.append(asmbly)
+        return assembly_instruction or ''
+
+    def extract_packaging_details(self, response):
+        packaging_details = []
+        package_details = response.xpath('//div[@id="SEC_HIDDEN_measurements-packaging"]/div//div')
+        for p in package_details:
+            try:
+                p1 = p.xpath('./p')
+                for p1_ in p1:
+                    packaging_details.append(self.replace_normalize(''.join(p1_.xpath('.//text()').getall())))
+            except:
+                p1 = ''
+            if not p1:
+                try:
+                    p2 = p.xpath('./span')
+                    for p2_ in p2:
+                        packaging_details.append(self.replace_normalize(' '.join(p2_.xpath('.//text()').getall())))
+                except:
+                    p2 = ''
+        return '\n'.join(packaging_details)
+
+    def get_return_policy(self):
+        try:
+            headers = {
+                'authority': 'www.ikea.com',
+                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36',
+            }
+            response = requests.get('https://www.ikea.com/sg/en/customer-service/returns-claims/return-policy/', headers=headers)
+            res = html.fromstring(response.text)
+            policy_title = self.replace_normalize(''.join(res.xpath('//h1//text()')))
+            policy_text = self.replace_normalize('\n'.join(res.xpath('//h1/ancestor::section[1]/following-sibling::section[1]//text()')))
+            return policy_title + '\n' + policy_text
+        except Exception as e:
+            logger.error(f"Error getting return policy: {e}")
+            return ''
+
+    def save_to_csv(self, item):
+        file_name = "Ikea_Data.csv"
+        df = pd.DataFrame([item])
+        if os.path.exists(file_name):
+            df.to_csv(file_name, mode='a', index=False, header=False, encoding='cp1252')
+        else:
+            df.to_csv(file_name, mode='a', index=False, header=True, encoding='cp1252')
+
+    def get_data(self):
+        count = 0
+        try:
+            resp = self.session.get('https://www.ikea.com/sg/en/cat/products-products/')
+            resp1 = Selector(text=resp.text)
+            urls = resp1.xpath('//a[contains(text(),"Shop all")]/@href').getall()
+
+            for url in urls:
+                res1 = self.session.get(url)
+                resp11 = Selector(text=res1.text)
+                links = resp11.xpath('//div[@class="vn-carousel"]//a/@href').getall()
+
+                for link in links:
+                    res2_page = self.session.get(link)
+                    res22_page = Selector(text=res2_page.text)
+                    total_result = res22_page.xpath('//*[@class="catalog-product-list__total-count"]/text()').get()
+                    total_result = total_result.split('of')[1].strip()
+                    pagecount = int(int(total_result) / 24) + 1
+
+                    for i in range(1, pagecount + 1):
+                        next_page = link + f'?page={i}'
+                        self.driver.get(next_page)
+                        time.sleep(2)
+                        res22 = Selector(text=self.driver.page_source)
+                        divs = res22.xpath('//div[@data-testid="plp-product-card"]')
+
+                        for div in divs:
+                            all_products = div.xpath('.//div[@class="pip-product-compact"]')
+                            for p in all_products:
+                                product_url = p.xpath('./a/@href').get()
+                                if product_url:
+                                    self.driver.get(product_url)
+                                    time.sleep(3)
+                                    response = Selector(text=self.driver.page_source)
+                                    count += 1
+                                    self.get_product_details(response, product_url, count, self.driver.page_source)
+
+                                    variants_links = []
+                                    variants_types = self.get_variant_types()
+                                    for v_type in variants_types:
+                                        self.driver.execute_script("arguments[0].scrollIntoView();", v_type)
+                                        self.close_floating_banner()
+                                        self.click_variant_type(v_type)
+                                        variants_links += self.extract_variant_links()
+
+                                    if variants_links:
+                                        logger.info("==Variants Data==")
+                                        for var_link in variants_links:
+                                            count += 1
+                                            self.driver.get(var_link)
+                                            time.sleep(3)
+                                            var_response = Selector(text=self.driver.page_source)
+                                            self.get_product_details(var_response, var_link, count, self.driver.page_source)
+        except Exception as e:
+            logger.error(f"Error getting data: {e}")
+
+    def get_variant_types(self):
+        variants_types = []
+        try:
+            choose_colour = WebDriverWait(self.driver, 10).until(
+                EC.visibility_of_element_located((By.XPATH,
+                                                  '//*[@class="pip-chunky-header__title"][contains(text(),"Choose colour")]/ancestor::button')))
+            variants_types.append(choose_colour)
+        except:
+            pass
+
+        try:
+            choose_front = WebDriverWait(self.driver, 10).until(
+                EC.visibility_of_element_located((By.XPATH,
+                                                  '//*[@class="pip-chunky-header__title"][contains(text(),"Choose front")]/ancestor::button')))
+            variants_types.append(choose_front)
+        except:
+            pass
+
+        try:
+            choose_size = WebDriverWait(self.driver, 10).until(
+                EC.visibility_of_element_located((By.XPATH,
+                                                  '//*[@class="pip-chunky-header__title"][contains(text(),"Choose size")]/ancestor::button')))
+            variants_types.append(choose_size)
+        except:
+            pass
+
+        return variants_types
+
+    def close_floating_banner(self):
+        try:
+            floating_banner = self.driver.find_element(By.XPATH, '//div[@class="floatingbanner active"]//span[@class="close-btn icon-cross_thin_64"]')
+            floating_banner.click()
+        except:
+            pass
+
+    def click_variant_type(self, variant_type):
+        try:
+            variant_type.click()
+        except:
+            variant_type.click()
+
+    def extract_variant_links(self):
+        variant_links = []
+        try:
+            variants = WebDriverWait(self.driver, 10).until(
+                EC.visibility_of_all_elements_located((By.XPATH, '//div[@class="pip-product-variation"]//div[@class="pip-link-list"]/a')))
+            for i in variants:
+                v_url = i.get_attribute('href')
+                if v_url not in variant_links:
+                    variant_links.append(v_url)
+        except Exception as e:
+            logger.error(f"Error extracting variant links: {e}")
+        return variant_links
+
+if __name__ == "__main__":
+    ikea_scraper = Ikea()
+    ikea_scraper.get_data()
